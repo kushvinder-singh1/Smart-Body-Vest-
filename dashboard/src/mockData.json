@@ -1,0 +1,27 @@
+[
+  {
+    "body_temp": 36.6,
+    "battery": 82,
+    "mode": "AUTO",
+    "alerts": { "latest": "" },
+    "zones": {
+      "zone1": { "intensity": 60 },
+      "zone2": { "intensity": 40 }
+    },
+    "ai_models": {
+      "lstm": {
+        "predicted_temp_15min": 37.2,
+        "latency_ms": 38,
+        "status": "OK"
+      },
+      "dnn": {
+        "latency_ms": 25,
+        "status": "OK"
+      },
+      "pipeline": {
+        "sync_delay_ms": 3,
+        "mode": "AUTO"
+      }
+    }
+  }
+]
