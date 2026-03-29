@@ -1,0 +1,27 @@
+DNN heating class report (pad PWM classes)
+Bins: off <12.5%, low 12.5-37.5, med 37.5-67.5, high >67.5 (matches 0/25/50/85).
+Test MAE (approx % PWM): pad1=22.57% pad2=22.57%
+
+Pad1 classification report
+              precision    recall  f1-score   support
+
+         off       0.00      0.00      0.00        12
+         low       0.00      0.00      0.00       533
+         med       0.38      0.00      0.01      1768
+        high       0.54      1.00      0.70      2670
+
+    accuracy                           0.54      4983
+   macro avg       0.23      0.25      0.18      4983
+weighted avg       0.42      0.54      0.38      4983
+
+Pad2 classification report
+              precision    recall  f1-score   support
+
+         off       0.00      0.00      0.00        12
+         low       0.00      0.00      0.00       533
+         med       0.38      0.00      0.01      1768
+        high       0.54      1.00      0.70      2670
+
+    accuracy                           0.54      4983
+   macro avg       0.23      0.25      0.18      4983
+weighted avg       0.42      0.54      0.38      4983

@@ -1,0 +1,22 @@
+Pad level classifier (LSTM + DNN, focal loss) — hold-out test set
+seq_len=24 n_features=10 num_classes=4
+Accuracy: 0.9864
+Balanced accuracy: 0.9865
+Macro F1: 0.9865 | Weighted F1: 0.9865
+
+Confusion matrix [true x pred]:
+[[1137   10    0    0]
+ [   5 1150   12    0]
+ [   0   15 1141    7]
+ [   0    0   14 1158]]
+
+              precision    recall  f1-score   support
+
+         OFF       1.00      0.99      0.99      1147
+         LOW       0.98      0.99      0.98      1167
+      MEDIUM       0.98      0.98      0.98      1163
+        HIGH       0.99      0.99      0.99      1172
+
+    accuracy                           0.99      4649
+   macro avg       0.99      0.99      0.99      4649
+weighted avg       0.99      0.99      0.99      4649

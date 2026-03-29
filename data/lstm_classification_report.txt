@@ -1,0 +1,12 @@
+LSTM temperature class report (cold/comfort/hot)
+Classes based on comfort thresholds in config.py.
+
+              precision    recall  f1-score   support
+
+        cold       1.00      1.00      1.00      4341
+     comfort       0.00      0.00      0.00         6
+         hot       0.00      0.00      0.00         0
+
+    accuracy                           1.00      4347
+   macro avg       0.33      0.33      0.33      4347
+weighted avg       1.00      1.00      1.00      4347
