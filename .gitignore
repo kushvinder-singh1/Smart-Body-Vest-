@@ -1,0 +1,22 @@
+# Firebase credentials — never commit
+*-firebase-adminsdk-*.json
+serviceAccountKey.json
+
+# Environment
+.env
+dashboard/.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Data and models
+data/
+models/
+*.npy
+*.pkl
+*.keras
+*.tflite
