@@ -39,10 +39,7 @@ def adjust_pad_level_after_prediction(
         if float(temp_c) <= 34.0:
             out = "HIGH"
 
-    if temp_c is not None:
-        t = float(temp_c)
-        if t >= 39.0 or t <= 35.0:
-            return "OFF"
+    
 
     if pulse_bpm is not None and float(pulse_bpm) >= 120.0:
         if out == "HIGH":
