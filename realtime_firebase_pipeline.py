@@ -72,6 +72,8 @@ from module2.inference_utils import (
 from module2.rolling_buffer import RollingFeatureBuffer
 from module2.safety import adjust_pad_level_after_prediction
 from module2.tflite_pad_inference import PadLevelTfliteInterpreter
+from module2.sensor_payload import get_sensor_payload
+from module2.user_profile import get_resolved_uid, get_user_profile
 
 LABELS: Tuple[str, ...] = tuple(config.PAD_LEVEL_CLASSES)
 
@@ -249,68 +251,39 @@ def load_scaler_and_tflite() -> Tuple[Any, PadLevelTfliteInterpreter, Path, Path
     return scaler, interp, scaler_path.resolve(), tflite_path.resolve()
 
 
-def fetch_profile() -> Dict[str, Any]:
-    try:
-        ref = db.reference(config.FIREBASE_PATH_USER_PROFILE)
-        d = ref.get()
-        return d if isinstance(d, dict) else {}
-    except Exception:
-        return {}
-
-
 def fetch_sensor_merged() -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[Tuple[Any, ...]]]:
-    profile = fetch_profile()
-    if not READ_PATHS:
+    """
+    Unified sensor source:
+      1) sensors/latest
+      2) users/{uid}/sensor
+    """
+    uid = get_resolved_uid()
+    payload = get_sensor_payload(uid)
+    if payload is None:
         return None, None, None
-    for path in READ_PATHS:
-        try:
-            snap = db.reference(path).get()
-        except Exception:
-            continue
-        if not snap or not isinstance(snap, dict):
-            continue
-        norm = normalize_sensor_payload(snap)
-        temp, pulse = norm.get("temp"), norm.get("pulse")
-        if temp is None or pulse is None:
-            continue
-        if norm.get("age_years") is None:
-            norm["age_years"] = _to_number(profile.get(config.COL_AGE, profile.get("age")))
-        if norm.get("height_cm") is None:
-            norm["height_cm"] = _to_number(
-                profile.get(config.COL_HEIGHT_CM, profile.get("height"))
-            )
-        if norm.get("weight_kg") is None:
-            norm["weight_kg"] = _to_number(
-                profile.get(config.COL_WEIGHT_KG, profile.get("weight"))
-            )
-        if norm.get("gender_0_1") is None:
-            norm["gender_0_1"] = _to_gender_numeric(
-                profile.get(config.COL_GENDER, profile.get("gender"))
-            )
-        norm["age_years"] = float(
-            norm["age_years"] if norm["age_years"] is not None else config.DEFAULT_AGE_YEARS
-        )
-        norm["height_cm"] = float(
-            norm["height_cm"] if norm["height_cm"] is not None else config.DEFAULT_HEIGHT_CM
-        )
-        norm["weight_kg"] = float(
-            norm["weight_kg"] if norm["weight_kg"] is not None else config.DEFAULT_WEIGHT_KG
-        )
-        norm["gender_0_1"] = float(
-            norm["gender_0_1"] if norm["gender_0_1"] is not None else config.DEFAULT_GENDER_0_1
-        )
-        if norm.get("motion_level_0_1") is None:
-            norm["motion_level_0_1"] = 0.0
-        motion = float(norm["motion_level_0_1"])
-        ts_raw = snap.get(config.COL_TIMESTAMP, snap.get("ts", snap.get("time")))
-        fingerprint = (
-            ts_raw,
-            round(float(temp), 4),
-            round(float(pulse), 2),
-            round(motion, 2),
-        )
-        return norm, path, fingerprint
-    return None, None, None
+
+    print("[sensor] using payload:", payload, flush=True)
+    norm = normalize_sensor_payload(payload)
+    temp, pulse = norm.get("temp"), norm.get("pulse")
+    if temp is None or pulse is None:
+        return None, None, None
+
+    profile = get_user_profile()
+    # Prefer per-sensor demographics if present; otherwise use Firebase-resolved profile.
+    if norm.get("age_years") is None:
+        norm["age_years"] = float(profile["age_years"])
+    if norm.get("height_cm") is None:
+        norm["height_cm"] = float(profile["height_cm"])
+    if norm.get("weight_kg") is None:
+        norm["weight_kg"] = float(profile["weight_kg"])
+    if norm.get("gender_0_1") is None:
+        norm["gender_0_1"] = float(profile["gender_0_1"])
+    if norm.get("motion_level_0_1") is None:
+        norm["motion_level_0_1"] = 0.0
+
+    motion = float(norm["motion_level_0_1"])
+    fingerprint = (round(float(temp), 4), round(float(pulse), 2), round(motion, 2))
+    return norm, "unified_sensor", fingerprint
 
 
 def write_pad_level(
@@ -460,6 +433,7 @@ def main() -> None:
                     inf_state = "fallback"
                 else:
                     try:
+                        print("[model] running inference", flush=True)
                         probs, latency_ms = interp.predict_proba_timed(scaled_batch)
                         if float(np.max(probs)) < conf_min:
                             fb = fallback_pad_level_from_temp(t)
@@ -478,6 +452,7 @@ def main() -> None:
                 k = int(np.argmax(avg_probs))
                 ml_level = LABELS[k]
                 level = adjust_pad_level_after_prediction(t, raw_pulse_in, ml_level)
+                print("[model] prediction:", level, flush=True)
 
                 now = time.monotonic()
                 if now >= next_dbg:

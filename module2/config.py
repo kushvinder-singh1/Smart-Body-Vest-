@@ -139,6 +139,12 @@ FIREBASE_PATH_SENSORS = "sensors/latest"
 FIREBASE_PATH_COMMAND = "heating/command"
 FIREBASE_PATH_USER_PROFILE = "user/profile"
 
+# New (preferred) Firebase user profile structure:
+# - meta/current_user/uid -> active user id
+# - users/{uid}/ -> profile fields
+FIREBASE_PATH_META_CURRENT_USER = "meta/current_user"
+FIREBASE_PATH_USERS = "users"
+
 DEFAULT_AGE_YEARS = 28.0
 DEFAULT_HEIGHT_CM = 170.0
 DEFAULT_WEIGHT_KG = 70.0

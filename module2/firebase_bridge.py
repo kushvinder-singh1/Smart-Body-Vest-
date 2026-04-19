@@ -23,6 +23,7 @@ from .inference_utils import (
     validate_sequence_batch_shape,
 )
 from .rolling_buffer import RollingFeatureBuffer
+from .user_profile import get_user_profile
 
 # Load .env from project root if python-dotenv available
 try:
@@ -277,14 +278,6 @@ def listen_and_process():
             sensor_paths.append(p)
 
     last_processed = {"temp": None, "pulse": None}
-    profile_ref = db.reference(config.FIREBASE_PATH_USER_PROFILE)
-
-    def _load_profile():
-        try:
-            p = profile_ref.get()
-            return p if isinstance(p, dict) else {}
-        except Exception:
-            return {}
 
     def handle_sensor_payload(payload: Any):
         buf.maybe_reset_if_stale(time.monotonic())
@@ -309,23 +302,16 @@ def listen_and_process():
             motion = (battery / 100.0) if battery is not None else 0.5
         motion = 1.0 if float(motion) >= 0.5 else 0.0
 
-        profile = _load_profile()
+        profile = get_user_profile()
         age = norm.get("age_years")
         height = norm.get("height_cm")
         weight = norm.get("weight_kg")
         gender = norm.get("gender_0_1")
-        if age is None:
-            age = _to_number(profile.get("age_years", profile.get("age")))
-        if height is None:
-            height = _to_number(profile.get("height_cm", profile.get("height")))
-        if weight is None:
-            weight = _to_number(profile.get("weight_kg", profile.get("weight")))
-        if gender is None:
-            gender = _to_gender_numeric(profile.get("gender_0_1", profile.get("gender")))
-        age = age if age is not None else config.DEFAULT_AGE_YEARS
-        height = height if height is not None else config.DEFAULT_HEIGHT_CM
-        weight = weight if weight is not None else config.DEFAULT_WEIGHT_KG
-        gender = gender if gender is not None else config.DEFAULT_GENDER_0_1
+        # Prefer per-payload demographics if present; otherwise use Firebase-resolved profile.
+        age = float(age) if age is not None else float(profile["age_years"])
+        height = float(height) if height is not None else float(profile["height_cm"])
+        weight = float(weight) if weight is not None else float(profile["weight_kg"])
+        gender = float(gender) if gender is not None else float(profile["gender_0_1"])
 
         level, state, source, latency_ms = process_sensor_data(
             temp,
