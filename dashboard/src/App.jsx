@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef } from 'react'
-import { motion } from 'framer-motion'
+import { useNavigate } from 'react-router-dom'
+import { motion, AnimatePresence } from 'framer-motion'
 import { Container, Card } from 'react-bootstrap'
-import { Sun, Moon, BarChart3, ChevronDown, ChevronUp } from 'lucide-react'
+import { Sun, Moon, AlertTriangle } from 'lucide-react'
 import {
   subscribeToSensors,
   subscribeToCommand,
@@ -9,17 +10,44 @@ import {
   logout,
   loadUserProfile,
   saveUserProfile,
+  setDeviceStatus,
   isFirebaseConfigured,
 } from './firebase'
-import AuthPage from './AuthPage'
 import MetricCard from './components/MetricCard'
 import HeatingGauge from './components/HeatingGauge'
 import StatusBar from './components/StatusBar'
-import AnalysisPanel from './components/AnalysisPanel'
+import logo from './logo.png'
+import { listenToCurrentUser } from './firebase'
+
+// ─── CONSTANTS ────────────────────────────────────────────────────────────────
+
+const PAD_LABEL_TO_PCT  = { off: 0, low: 33.33, medium: 66.66, high: 100 }
+
+const PAD_IDLE_TIMEOUT_MS = 10 * 60 * 1000
+const PAD_IDLE_WARN_MS    =  9 * 60 * 1000
+
+const TEMP_SENSOR_MIN   = 34
+const TEMP_SAFETY_OFF   = 39
+const TEMP_SAFETY_LOW   = 35
+const PULSE_REDUCE_HEAT = 120
+
+// ─── FALLBACK HEATING ─────────────────────────────────────────────────────────
+
+function getFallbackHeatingLevel(temp) {
+  if (temp === null || temp === 0) return 'off'
+  if (temp < 35)                   return 'high'
+  if (temp < 35.5)                 return 'medium'
+  if (temp < 36)                   return 'low'
+  return 'off'
+}
+
+// ─── NORMALISE SENSORS ────────────────────────────────────────────────────────
 
 function normalizeSensorsPayload(payload) {
   if (!payload || typeof payload !== 'object') return {}
-  const sensor = payload.sensor && typeof payload.sensor === 'object' ? payload.sensor : payload
+
+  const sensor =
+    payload.sensor && typeof payload.sensor === 'object' ? payload.sensor : payload
 
   const toNum = (v) => {
     if (typeof v === 'number') return v
@@ -32,44 +60,76 @@ function normalizeSensorsPayload(payload) {
     return null
   }
 
-  const temp    = toNum(sensor.body_temperature_C) ?? toNum(sensor.temp)      ?? null
-  const pulse   = toNum(sensor.pulse_bpm)           ?? toNum(sensor.pulse)    ?? null
-  const battery = toNum(sensor.battery_percent)     ?? toNum(sensor.battery)  ?? null
-  const pad1    = toNum(sensor.pad1_pwm_0_100)      ?? toNum(sensor.pad1)     ?? null
-  const pad2    = toNum(sensor.pad2_pwm_0_100)      ?? toNum(sensor.pad2)     ?? null
+  const toPadLabel = (v) => {
+    if (typeof v === 'string') {
+      const s = v.trim().toLowerCase()
+      if (['off', 'low', 'medium', 'high'].includes(s)) return s
+    }
+    return null
+  }
 
-  return { temp, pulse, battery, pad1, pad2 }
+  let temp         = toNum(sensor.body_temperature_C) ?? toNum(sensor.temp)     ?? null
+  let pulse        = toNum(sensor.pulse_bpm)           ?? toNum(sensor.pulse)   ?? null
+  let battery      = toNum(sensor.battery_percent)     ?? toNum(sensor.battery) ?? null
+  let motionSensor = toNum(sensor.motion) ?? null
+
+  if (temp !== null && temp <= TEMP_SENSOR_MIN) {
+    temp         = 0
+    pulse        = 0
+    motionSensor = 0
+  }
+
+  const heatingLevel = payload?.heating?.level ?? null
+  const pad1 = toPadLabel(heatingLevel)
+  const pad2 = toPadLabel(heatingLevel)
+
+  return { temp, pulse, battery, pad1, pad2, motion: motionSensor }
 }
 
-const container = {
+// ─── ANIMATION VARIANTS ───────────────────────────────────────────────────────
+
+const containerVariants = {
   hidden: { opacity: 0 },
-  show: { opacity: 1, transition: { staggerChildren: 0.1, delayChildren: 0.2 } },
+  show: {
+    opacity: 1,
+    transition: { staggerChildren: 0.1, delayChildren: 0.2 },
+  },
 }
-const item = { hidden: { opacity: 0, y: 20 }, show: { opacity: 1, y: 0 } }
+const itemVariants = {
+  hidden: { opacity: 0, y: 20 },
+  show:   { opacity: 1, y: 0 },
+}
+
+// ─── COMPONENT ────────────────────────────────────────────────────────────────
 
 export default function App() {
-  // ── auth ──────────────────────────────────────────────────────────────────
-  const [user, setUser]           = useState(null)
+  const navigate = useNavigate()
+
+  // auth
+  const [user,      setUser]      = useState(null)
   const [authReady, setAuthReady] = useState(false)
 
-  // ── sensor data ───────────────────────────────────────────────────────────
-  const [sensors, setSensors]     = useState(null)
-  const [command, setCommand]     = useState(null)
+  // sensors
+  const [sensors,   setSensors]   = useState(null)
+  const [command,   setCommand]   = useState(null)
   const [connected, setConnected] = useState(false)
-  const [history, setHistory]     = useState([])
+  const [history,   setHistory]   = useState([])
   const lastHistoryKeyRef         = useRef(null)
 
-  // ── UI ────────────────────────────────────────────────────────────────────
-  const [showAnalysis, setShowAnalysis] = useState(false)
+  // pad idle
+  const [showPadWarning, setShowPadWarning] = useState(false)
+  const [deviceIdle,     setDeviceIdle]     = useState(false)
+  const padIdleTimerRef                     = useRef(null)
+  const padIdleWarnRef                      = useRef(null)
 
-  // ── profile ───────────────────────────────────────────────────────────────
+  // profile
   const [profile, setProfile] = useState({
     age_years: '', height_cm: '', weight_kg: '', gender_0_1: '1',
   })
   const [profileSubmitted, setProfileSubmitted] = useState(false)
-  const [profileError, setProfileError]         = useState('')
+  const [profileError,     setProfileError]     = useState('')
 
-  // ── theme ─────────────────────────────────────────────────────────────────
+  // theme
   const [theme, setTheme] = useState(() => {
     if (typeof window === 'undefined') return 'dark'
     const stored = window.localStorage.getItem('dashboard-theme')
@@ -77,9 +137,13 @@ export default function App() {
     return window.matchMedia?.('(prefers-color-scheme: light)').matches ? 'light' : 'dark'
   })
 
-  // ── subscriptions ─────────────────────────────────────────────────────────
+  // ─── AUTH SUBSCRIPTION ────────────────────────────────────────────────────
+
   useEffect(() => {
-    if (!isFirebaseConfigured) { setAuthReady(true); return }
+    if (!isFirebaseConfigured) {
+      setAuthReady(true)
+      return
+    }
     const unsub = subscribeToAuth(async (u) => {
       setUser(u)
       setAuthReady(true)
@@ -95,30 +159,77 @@ export default function App() {
             gender_0_1: String(existing.gender_0_1 ?? '1'),
           })
           setProfileSubmitted(true)
+        } else {
+          navigate('/profile')
         }
       }
     })
     return () => unsub()
-  }, [])
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ─── SENSOR SUBSCRIPTION (user-scoped) ───────────────────────────────────
 
   useEffect(() => {
-    if (!isFirebaseConfigured) return
-    const unsubSensors = subscribeToSensors((data) => { setSensors(data); setConnected(true) })
-    const unsubCmd     = subscribeToCommand((data) => setCommand(data))
-    return () => { unsubSensors(); unsubCmd() }
+    let sensorUnsub = null
+    let commandUnsub = null
+    const currentUIDRef = { current: null }
+
+    const unsubMeta = listenToCurrentUser((uid) => {
+      if (!uid) {
+        setSensors(null)
+        setConnected(false)
+        return
+      }
+
+      if (uid === currentUIDRef.current) return
+
+      if (sensorUnsub) sensorUnsub()
+      if (commandUnsub) commandUnsub()
+
+      currentUIDRef.current = uid
+
+      sensorUnsub = subscribeToSensors(uid, (data) => {
+        setSensors(data)
+        setConnected(true)
+      })
+
+      commandUnsub = subscribeToCommand((data) => {
+        setCommand(data)
+      })
+    })
+
+    return () => {
+      if (sensorUnsub) sensorUnsub()
+      if (commandUnsub) commandUnsub()
+      if (unsubMeta) unsubMeta()
+    }
   }, [])
+
+  // ─── THEME SYNC ───────────────────────────────────────────────────────────
 
   useEffect(() => {
     document.body.dataset.theme = theme
-    document.documentElement.setAttribute('data-bs-theme', theme === 'light' ? 'light' : 'dark')
+    document.documentElement.setAttribute(
+      'data-bs-theme',
+      theme === 'light' ? 'light' : 'dark'
+    )
     window.localStorage.setItem('dashboard-theme', theme)
   }, [theme])
+
+  // ─── AUTH REDIRECT ────────────────────────────────────────────────────────
+
+  useEffect(() => {
+    if (authReady && !user) navigate('/auth')   // ← unauthenticated → auth page
+  }, [authReady, user]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ─── HISTORY RING-BUFFER ──────────────────────────────────────────────────
 
   useEffect(() => {
     if (!sensors) return
     const tsRaw =
       sensors?.timestamp ?? sensors?.ts ?? sensors?.time ??
-      sensors?.sensor?.timestamp ?? sensors?.sensor?.ts ?? sensors?.sensor?.time ?? null
+      sensors?.sensor?.timestamp ?? sensors?.sensor?.ts ??
+      sensors?.sensor?.time ?? null
     const ts = typeof tsRaw === 'number' ? tsRaw : Date.now()
     const norm = normalizeSensorsPayload(sensors)
     const point = {
@@ -126,8 +237,8 @@ export default function App() {
       temp:    norm.temp,
       pulse:   norm.pulse,
       battery: norm.battery,
-      pad1: Number(command?.pad1 ?? norm.pad1 ?? sensors?.pad1_pwm_0_100 ?? 0),
-      pad2: Number(command?.pad2 ?? norm.pad2 ?? sensors?.pad2_pwm_0_100 ?? 0),
+      pad1:    command?.level ?? 'off',
+      pad2:    command?.level ?? 'off',
     }
     const key = `${point.ts}|${point.temp}|${point.pulse}|${point.battery}|${point.pad1}|${point.pad2}`
     if (lastHistoryKeyRef.current === key) return
@@ -138,33 +249,108 @@ export default function App() {
     })
   }, [sensors, command])
 
-  // ── derived values ────────────────────────────────────────────────────────
-  const norm    = normalizeSensorsPayload(sensors)
-  const temp    = norm.temp    ?? null
-  const pulse   = norm.pulse   ?? null
-  const battery = norm.battery ?? null
-  const pad1    = command?.pad1 ?? norm.pad1 ?? sensors?.pad1_pwm_0_100 ?? 0
-  const pad2    = command?.pad2 ?? norm.pad2 ?? sensors?.pad2_pwm_0_100 ?? 0
+  // ─── DERIVED VALUES ───────────────────────────────────────────────────────
 
-  const isSafe =
-    temp != null && temp >= 35 && temp <= 39 &&
-    pulse != null && pulse >= 40 && pulse <= 120
+  const norm        = normalizeSensorsPayload(sensors)
+  const temp        = norm.temp    ?? null
+  const pulse       = norm.pulse   ?? null
+  const battery     = norm.battery ?? null
+  const motionVal   = norm.motion  ?? null
+  const motionLabel = motionVal === 1 ? 'Active' : motionVal === 0 ? 'Still' : '--'
 
-  const comfort = (() => {
-    if (temp == null || pulse == null) return { label: 'Waiting for data',   detail: 'Vest will adjust once readings arrive.',      tone: 'secondary' }
-    if (temp < 35)                     return { label: 'You may feel cold',   detail: 'Increase heating or move to a warmer place.', tone: 'warning'   }
-    if (temp > 38.5 || pulse > 120)   return { label: 'Too warm / stressed', detail: 'Reduce heating and take a short break.',      tone: 'danger'    }
-    return                                    { label: 'Comfortable',         detail: 'You are within the target comfort range.',    tone: 'success'   }
+  const rawPadLabel =
+    (
+      sensors?.heat_level ??
+      sensors?.sensor?.heat_level ??
+      command?.level ??
+      ''
+    )
+      .toLowerCase() || null
+
+  const safetyOverride = (() => {
+    if (temp === 0 || temp === null) return null
+    if (temp >= TEMP_SAFETY_OFF)     return 'off'
+    if (temp <= TEMP_SAFETY_LOW)     return 'off'
+    if (pulse !== null && pulse >= PULSE_REDUCE_HEAT) {
+      const reduce = { high: 'medium', medium: 'low', low: 'off', off: 'off' }
+      return reduce[rawPadLabel] ?? 'low'
+    }
+    return null
   })()
 
-  const padIntensityLabel = (pct) => {
-    if (pct <= 5)  return 'Off'
-    if (pct <= 35) return 'Low'
-    if (pct <= 70) return 'Medium'
-    return 'High'
-  }
+  const isFallback    = !rawPadLabel || temp === 0 || temp === null
+  const fallbackLevel = getFallbackHeatingLevel(temp)
 
-  // ── profile submit ────────────────────────────────────────────────────────
+  const pad1Label = safetyOverride ?? (isFallback ? fallbackLevel : rawPadLabel)
+  const pad2Label = pad1Label
+  const pad1Pct   = PAD_LABEL_TO_PCT[pad1Label] ?? 0
+  const pad2Pct   = PAD_LABEL_TO_PCT[pad2Label] ?? 0
+
+  const isSafe =
+    temp  != null && temp  > TEMP_SENSOR_MIN && temp  < TEMP_SAFETY_OFF &&
+    pulse != null && pulse > 0               && pulse < PULSE_REDUCE_HEAT
+
+  const comfort = (() => {
+    if (temp === 0 || temp === null || pulse === 0 || pulse === null)
+      return { label: 'Vest not detected',          detail: 'No valid readings — please wear the vest properly.',        tone: 'secondary' }
+    if (temp >= TEMP_SAFETY_OFF)
+      return { label: 'Overheating — heating off',  detail: 'Temperature too high. Heating has been disabled.',          tone: 'danger'    }
+    if (temp <= TEMP_SAFETY_LOW)
+      return { label: 'Too cold — heating off',     detail: 'Temperature below safe threshold. Check vest fit.',         tone: 'warning'   }
+    if (pulse >= PULSE_REDUCE_HEAT)
+      return { label: 'High heart rate',            detail: 'Heating level reduced until pulse normalises.',             tone: 'warning'   }
+    if (isFallback && temp > TEMP_SENSOR_MIN)
+      return { label: 'Warming up',                 detail: 'Fallback heating active — waiting for model data.',         tone: 'info'      }
+    return   { label: 'Comfortable',                detail: 'You are within the target comfort range.',                  tone: 'success'   }
+  })()
+
+  // ─── PAD IDLE DETECTION ───────────────────────────────────────────────────
+
+  useEffect(() => {
+    if (!user?.uid) {
+      clearTimeout(padIdleTimerRef.current)
+      clearTimeout(padIdleWarnRef.current)
+      return
+    }
+
+    const padIsOff = !pad1Label || pad1Label === 'off'
+
+    if (padIsOff) {
+      if (!padIdleTimerRef.current) {
+        padIdleWarnRef.current = setTimeout(() => {
+          setShowPadWarning(true)
+        }, PAD_IDLE_WARN_MS)
+
+        padIdleTimerRef.current = setTimeout(() => {
+          padIdleTimerRef.current = null
+          padIdleWarnRef.current  = null
+          setShowPadWarning(false)
+          setDeviceIdle(true)
+          setDeviceStatus(user.uid, 'idle')
+        }, PAD_IDLE_TIMEOUT_MS)
+      }
+    } else {
+      clearTimeout(padIdleTimerRef.current)
+      clearTimeout(padIdleWarnRef.current)
+      padIdleTimerRef.current = null
+      padIdleWarnRef.current  = null
+      setShowPadWarning(false)
+      if (deviceIdle) {
+        setDeviceIdle(false)
+        setDeviceStatus(user.uid, 'active')
+      }
+    }
+  }, [pad1Label, user?.uid]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    return () => {
+      clearTimeout(padIdleTimerRef.current)
+      clearTimeout(padIdleWarnRef.current)
+    }
+  }, [])
+
+  // ─── PROFILE SUBMIT ───────────────────────────────────────────────────────
+
   const submitProfile = async (e) => {
     e.preventDefault()
     setProfileError('')
@@ -172,28 +358,32 @@ export default function App() {
     const height = Number(profile.height_cm)
     const weight = Number(profile.weight_kg)
     const gender = Number(profile.gender_0_1)
-    if (!Number.isFinite(age)    || age    <  5  || age    > 100) return setProfileError('Enter age between 5 and 100')
-    if (!Number.isFinite(height) || height <  90 || height > 230) return setProfileError('Enter height in cm between 90 and 230')
-    if (!Number.isFinite(weight) || weight <  20 || weight > 250) return setProfileError('Enter weight in kg between 20 and 250')
-    if (!user?.uid) return setProfileError('Please login first.')
-    const payload = { age_years: age, height_cm: height, weight_kg: weight, gender_0_1: gender === 1 ? 1 : 0 }
+    if (!Number.isFinite(age)    || age    <  5  || age    > 100) { setProfileError('Enter age between 5 and 100');          return }
+    if (!Number.isFinite(height) || height <  90 || height > 230) { setProfileError('Enter height in cm between 90 and 230'); return }
+    if (!Number.isFinite(weight) || weight <  20 || weight > 250) { setProfileError('Enter weight in kg between 20 and 250'); return }
+    if (!user?.uid) { setProfileError('Please login first.'); return }
+    const payload = {
+      age_years:  age,
+      height_cm:  height,
+      weight_kg:  weight,
+      gender_0_1: gender === 1 ? 1 : 0,
+    }
     if (isFirebaseConfigured) await saveUserProfile(user.uid, payload)
     setProfileSubmitted(true)
   }
 
-  // ── render ────────────────────────────────────────────────────────────────
+  // ─── LOADING GUARD ────────────────────────────────────────────────────────
 
-  // Avoid flashing AuthPage before Firebase resolves the session
-  if (!authReady) return (
-    <div style={{ minHeight: '100dvh', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-      <span className="spinner-border text-secondary" />
-    </div>
-  )
+  if (!authReady || !user) {
+    return (
+      <div style={{ minHeight: '100dvh', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        <span className="spinner-border text-secondary" />
+      </div>
+    )
+  }
 
-  // Not logged in → show the dedicated auth page
-  if (!user) return <AuthPage />
+  // ─── RENDER ───────────────────────────────────────────────────────────────
 
-  // Logged in → show the dashboard
   return (
     <div className="min-vh-100">
       <div className="dashboard-bg" />
@@ -208,11 +398,49 @@ export default function App() {
           className="alert alert-warning text-center rounded-0 mb-0 py-2 border-0"
           style={{ background: 'rgba(251,191,36,0.15)' }}
         >
-          Add Firebase Web config to <code className="text-warning">dashboard/.env</code>
+          Add Firebase Web config to{' '}
+          <code className="text-warning">dashboard/.env</code>
         </motion.div>
       )}
 
-      {/* ── header ── */}
+      <AnimatePresence>
+        {showPadWarning && !deviceIdle && (
+          <motion.div
+            key="pad-warn"
+            initial={{ opacity: 0, y: -16 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -16 }}
+            transition={{ duration: 0.25 }}
+            className="d-flex justify-content-center align-items-center gap-3 py-2 px-3 rounded-0 border-0"
+            style={{ background: 'rgba(251,191,36,0.15)', color: '#fbbf24' }}
+          >
+            <AlertTriangle size={16} />
+            <span>
+              Heating pads have been off for 9 minutes — vest will be marked idle in 1 minute.
+            </span>
+          </motion.div>
+        )}
+
+        {deviceIdle && (
+          <motion.div
+            key="pad-idle"
+            initial={{ opacity: 0, y: -16 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -16 }}
+            transition={{ duration: 0.25 }}
+            className="d-flex justify-content-center align-items-center gap-3 py-2 px-3 rounded-0 border-0"
+            style={{ background: 'rgba(99,102,241,0.15)', color: '#a5b4fc' }}
+          >
+            <AlertTriangle size={16} />
+            <span>
+              Vest marked as <strong>idle</strong> — heating pads off for 10+ minutes.
+              Monitoring continues.
+            </span>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Header */}
       <motion.header
         initial={{ opacity: 0, y: -20 }}
         animate={{ opacity: 1, y: 0 }}
@@ -222,8 +450,22 @@ export default function App() {
         <Container>
           <div className="d-flex justify-content-between align-items-center flex-wrap gap-2">
             <h1 className="h5 mb-0 d-flex align-items-center gap-3">
-              <span className="fs-3" style={{ color: 'var(--teal)', filter: 'drop-shadow(0 0 10px rgba(0,229,204,0.5))' }}>◇</span>
-              <span className="logo-text">Smart Heating Vest</span>
+              <img
+                src={logo}
+                alt="Logo"
+                style={{ height: '32px', width: '32px', objectFit: 'contain' }}
+              />
+              <span
+                className="logo-text"
+                style={{
+                  fontFamily: "var(--font-display)",
+                  fontSize: "2.05rem",
+                  fontWeight: 700,
+                  letterSpacing: "0.5px"
+                }}
+              >
+                HeatSync
+              </span>
             </h1>
             <div className="d-flex align-items-center gap-3">
               <StatusBar connected={connected} safe={isSafe} />
@@ -238,7 +480,19 @@ export default function App() {
               <button
                 type="button"
                 className="btn btn-sm btn-outline-secondary rounded-pill"
-                onClick={() => { if (window.confirm('Log out?')) logout() }}
+                onClick={() => navigate('/profile')}
+              >
+                Profile
+              </button>
+              <button
+                type="button"
+                className="btn btn-sm btn-outline-secondary rounded-pill"
+                onClick={() => {
+                  if (window.confirm('Log out?')) {
+                    logout()
+                    navigate('/')   // ← after logout go to landing
+                  }
+                }}
               >
                 Logout
               </button>
@@ -247,12 +501,15 @@ export default function App() {
         </Container>
       </motion.header>
 
-      {/* ── greeting bar ── */}
+      {/* Greeting bar */}
       <motion.div
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
         transition={{ delay: 0.3 }}
-        style={{ borderBottom: '1px solid var(--card-border)', background: 'rgba(255,255,255,0.02)' }}
+        style={{
+          borderBottom: '1px solid var(--card-border)',
+          background: 'rgba(255,255,255,0.02)',
+        }}
         className="py-2"
       >
         <Container>
@@ -266,65 +523,48 @@ export default function App() {
         </Container>
       </motion.div>
 
-      {/* ── main content ── */}
+      {/* Main content */}
       <main className="py-5">
         <Container>
 
-          {/* ── profile form (shown until submitted) ── */}
-          {!profileSubmitted && (
-            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="mb-4">
-              <Card className="glass-card border-0">
-                <Card.Body className="p-4">
-                  <h6 className="section-title mb-2">Enter User Details </h6>
-                  <form className="row g-3" onSubmit={submitProfile}>
-                    <div className="col-md-3">
-                      <label className="form-label">Age</label>
-                      <input className="form-control" type="number" value={profile.age_years}
-                        onChange={(e) => setProfile((p) => ({ ...p, age_years: e.target.value }))} required />
-                    </div>
-                    <div className="col-md-3">
-                      <label className="form-label">Height (cm)</label>
-                      <input className="form-control" type="number" step="0.1" value={profile.height_cm}
-                        onChange={(e) => setProfile((p) => ({ ...p, height_cm: e.target.value }))} required />
-                    </div>
-                    <div className="col-md-3">
-                      <label className="form-label">Weight (kg)</label>
-                      <input className="form-control" type="number" step="0.1" value={profile.weight_kg}
-                        onChange={(e) => setProfile((p) => ({ ...p, weight_kg: e.target.value }))} required />
-                    </div>
-                    <div className="col-md-3">
-                      <label className="form-label">Gender</label>
-                      <select className="form-select" value={profile.gender_0_1}
-                        onChange={(e) => setProfile((p) => ({ ...p, gender_0_1: e.target.value }))}>
-                        <option value="1">Male</option>
-                        <option value="0">Female</option>
-                      </select>
-                    </div>
-                    {profileError && <div className="col-12 text-warning small">{profileError}</div>}
-                    <div className="col-12">
-                      <button className="btn btn-primary" type="submit">Save Profile &amp; Start</button>
-                    </div>
-                  </form>
-                </Card.Body>
-              </Card>
+          {/* Metric cards */}
+          <motion.div
+            variants={containerVariants}
+            initial="hidden"
+            animate="show"
+            className="row g-4 mb-5"
+          >
+            <motion.div variants={itemVariants} className="col-md-4">
+              <MetricCard
+                label="Body Temperature"
+                value={temp != null && temp > 0 ? `${temp.toFixed(1)}°C` : '--'}
+                accent="coral"
+                icon="Thermometer"
+                range={{ min: 35, max: 39 }}
+                current={temp}
+              />
             </motion.div>
-          )}
+            <motion.div variants={itemVariants} className="col-md-4">
+              <MetricCard
+                label="Heart Rate"
+                value={pulse != null && pulse > 0 ? pulse : '--'}
+                unit="bpm"
+                accent="teal"
+                icon="Heart"
+                range={{ min: 40, max: 120 }}
+                current={pulse}
+              />
+            </motion.div>
+            <motion.div variants={itemVariants} className="col-md-4">
+              <MetricCard
+                label="Motion"
+                value={motionVal !== null && motionVal > 0 ? motionLabel : '--'}
+                accent="violet"
+                icon="Activity"
+              />
+            </motion.div>
 
-          {/* ── metric cards ── */}
-          <motion.div variants={container} initial="hidden" animate="show" className="row g-4 mb-5">
-            <motion.div variants={item} className="col-md-4">
-              <MetricCard label="Body Temperature" value={temp != null ? `${temp.toFixed(1)}°C` : '--'}
-                accent="coral" icon="Thermometer" range={{ min: 35, max: 39 }} current={temp} />
-            </motion.div>
-            <motion.div variants={item} className="col-md-4">
-              <MetricCard label="Heart Rate" value={pulse != null ? pulse : '--'} unit="bpm"
-                accent="teal" icon="Heart" range={{ min: 40, max: 120 }} current={pulse} />
-            </motion.div>
-            <motion.div variants={item} className="col-md-4">
-              <MetricCard label="Battery" value={battery != null ? `${battery.toFixed(0)}%` : '--'}
-                accent="violet" icon="Battery" range={{ min: 0, max: 100 }} current={battery} />
-            </motion.div>
-            <motion.div variants={item} className="col-12 mt-2">
+            <motion.div variants={itemVariants} className="col-12 mt-2">
               <Card className="glass-card border-0">
                 <Card.Body className="d-flex flex-column flex-md-row justify-content-between align-items-start gap-2">
                   <div>
@@ -332,91 +572,87 @@ export default function App() {
                     <div className={`fw-semibold text-${comfort.tone}`}>{comfort.label}</div>
                     <small className="text-muted">{comfort.detail}</small>
                   </div>
-                  <span className="badge rounded-pill bg-opacity-10 border"
-                    style={{ borderColor: 'var(--teal)', color: 'var(--teal)' }}>
-                    Temp {temp != null ? `${temp.toFixed(1)}°C` : '--'} · Pulse {pulse ?? '--'} bpm
+                  <span
+                    className="badge rounded-pill bg-opacity-10 border"
+                    style={{ borderColor: 'var(--teal)', color: 'var(--teal)' }}
+                  >
+                    Temp {temp != null && temp > 0 ? `${temp.toFixed(1)}°C` : '--'}
+                    {' · '}
+                    Pulse {pulse != null && pulse > 0 ? pulse : '--'} bpm
                   </span>
                 </Card.Body>
               </Card>
             </motion.div>
           </motion.div>
 
-          {/* ── heating gauges ── */}
-          <motion.h6 initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.4 }} className="section-title">
+          {/* Heating gauges */}
+          <motion.h6
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            transition={{ delay: 0.4 }}
+            className="section-title"
+          >
             Heating Control
           </motion.h6>
-          <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.5, duration: 0.4 }} className="row g-4 mb-5">
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.5, duration: 0.4 }}
+            className="row g-4 mb-5"
+          >
             <div className="col-md-6">
-              <HeatingGauge label="Pad 1" value={pad1} color="teal" />
-              <div className="text-center mt-2 text-muted small">{padIntensityLabel(pad1)} · {Number(pad1).toFixed(0)}%</div>
+              <HeatingGauge label="Pad 1" value={pad1Pct} color="teal" />
             </div>
             <div className="col-md-6">
-              <HeatingGauge label="Pad 2" value={pad2} color="coral" />
-              <div className="text-center mt-2 text-muted small">{padIntensityLabel(pad2)} · {Number(pad2).toFixed(0)}%</div>
+              <HeatingGauge label="Pad 2" value={pad2Pct} color="coral" />
             </div>
           </motion.div>
 
-          {/* ── analysis ── */}
-          <motion.h6 initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.55 }} className="section-title">
-            Analysis
-          </motion.h6>
-          <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.58, duration: 0.4 }} className="mb-4">
-            <Card className="glass-card border-0" role="button" tabIndex={0}
-              onClick={() => setShowAnalysis((v) => !v)}
-              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') setShowAnalysis((v) => !v) }}
-              aria-expanded={showAnalysis}>
-              <Card.Body className="p-4 d-flex align-items-center justify-content-between gap-3">
-                <div className="d-flex align-items-center gap-3">
-                  <span className="d-inline-flex align-items-center justify-content-center rounded-4"
-                    style={{ width: 44, height: 44, border: '1px solid var(--card-border)', background: 'rgba(255,255,255,0.03)', color: 'var(--teal)' }}>
-                    <BarChart3 size={20} />
-                  </span>
-                  <div>
-                    <div className="fw-bold" style={{ fontSize: 16 }}>Analysis graphs</div>
-                    <div className="text-muted" style={{ fontSize: 13 }}>
-                      Click to {showAnalysis ? 'hide' : 'show'} real-time trends and training plots
-                    </div>
-                  </div>
-                </div>
-                <div className="d-flex align-items-center gap-2 text-muted" style={{ fontSize: 13 }}>
-                  <span>{showAnalysis ? 'Hide' : 'Show'}</span>
-                  {showAnalysis ? <ChevronUp size={18} /> : <ChevronDown size={18} />}
-                </div>
-              </Card.Body>
-            </Card>
-          </motion.div>
-          {showAnalysis && (
-            <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25 }} className="mb-5">
-              <AnalysisPanel history={history} comfortRange={{ min: 36, max: 37.5 }} />
-            </motion.div>
-          )}
-
-          {/* ── system status ── */}
-          <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.6, duration: 0.4 }}>
+          {/* System status */}
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.6, duration: 0.4 }}
+          >
             <Card className="glass-card border-0">
               <Card.Body className="p-4">
                 <h6 className="section-title mb-3">System Status</h6>
                 <div className="d-flex flex-wrap gap-4">
+
                   <span className={`d-flex align-items-center gap-2 ${connected ? 'text-success' : 'text-secondary'}`}>
-                    <span className={`pulse-dot ${connected ? 'bg-success' : 'bg-secondary'}`}
-                      style={{ animationPlayState: connected ? 'running' : 'paused' }} />
-                    <span className="fw-semibold">{connected ? 'Cloud connected' : 'Waiting for data...'}</span>
+                    <span
+                      className={`pulse-dot ${connected ? 'bg-success' : 'bg-secondary'}`}
+                      style={{ animationPlayState: connected ? 'running' : 'paused' }}
+                    />
+                    <span className="fw-semibold">
+                      {connected ? 'Cloud connected' : 'Waiting for data...'}
+                    </span>
                   </span>
+
                   <span className={`d-flex align-items-center gap-2 ${isSafe ? 'text-success' : 'text-warning'}`}>
                     <span className={`pulse-dot ${isSafe ? 'bg-success' : 'bg-warning'}`} />
                     <span className="fw-semibold">
                       {isSafe
                         ? 'All systems nominal'
-                        : temp != null && pulse != null
+                        : temp != null && temp > 0 && pulse != null && pulse > 0
                           ? `Outside comfort range (T=${temp.toFixed(1)}°C, HR=${pulse} bpm)`
-                          : 'Check thresholds / missing data'}
+                          : 'Check vest — no valid readings'}
                     </span>
                   </span>
+
+                  {deviceIdle && (
+                    <span className="d-flex align-items-center gap-2" style={{ color: '#a5b4fc' }}>
+                      <span
+                        className="pulse-dot"
+                        style={{ background: '#a5b4fc', animationPlayState: 'paused' }}
+                      />
+                      <span className="fw-semibold">Device idle</span>
+                    </span>
+                  )}
                 </div>
               </Card.Body>
             </Card>
           </motion.div>
-
         </Container>
       </main>
     </div>
